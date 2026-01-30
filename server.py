@@ -3,7 +3,8 @@ from fastapi.responses import FileResponse
 import os
 import uuid
 
-app = FastAPI()
+# IMPORTANT: root_path is required for RunPod proxy
+app = FastAPI(root_path="")
 
 # Directory where uploaded files are stored
 BASE_DIR = "/workspace/files"
