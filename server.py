@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 import os, uuid, subprocess, requests
@@ -14,16 +14,20 @@ os.makedirs(WORK_DIR, exist_ok=True)
 
 class UpscaleRequest(BaseModel):
     video_url: HttpUrl
-    scale: int = 2  # 2x or 4x
+    scale: int = 2
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "runpod-upscale-api"}
+    return {
+        "status": "ok",
+        "service": "runpod-upscale-api",
+        "usage": "POST JSON to / with video_url"
+    }
 
 
-@app.post("/upscale-from-url")
-def upscale_from_url(payload: UpscaleRequest):
+@app.post("/")   # 👈 THIS IS THE KEY CHANGE
+def upscale_root(payload: UpscaleRequest):
     job_id = uuid.uuid4().hex
 
     input_video = f"{WORK_DIR}/{job_id}_input.mp4"
@@ -34,7 +38,7 @@ def upscale_from_url(payload: UpscaleRequest):
     os.makedirs(frames_dir, exist_ok=True)
     os.makedirs(up_dir, exist_ok=True)
 
-    # --- Download video ---
+    # Download
     try:
         r = requests.get(payload.video_url, stream=True, timeout=120)
         r.raise_for_status()
@@ -44,31 +48,30 @@ def upscale_from_url(payload: UpscaleRequest):
     except Exception as e:
         raise HTTPException(400, f"Download failed: {e}")
 
-    # --- Extract frames ---
+    # Extract frames
     subprocess.run([
         "ffmpeg", "-y", "-i", input_video,
         f"{frames_dir}/frame_%06d.png"
     ], check=True)
 
-    # --- Load AI upscaler ---
+    # AI Upscale
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = RealESRGAN(device, scale=payload.scale)
     model.load_weights("RealESRGAN_x4plus.pth", download=True)
 
-    # --- Upscale frames ---
     for f in sorted(os.listdir(frames_dir)):
         img = cv2.imread(f"{frames_dir}/{f}")
         out = model.predict(img)
         cv2.imwrite(f"{up_dir}/{f}", out)
 
-    # --- Rebuild video (Adobe-safe) ---
+    # Rebuild video (Adobe Stock safe)
     subprocess.run([
         "ffmpeg", "-y",
         "-framerate", "30",
         "-i", f"{up_dir}/frame_%06d.png",
         "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
         "-profile:v", "high",
+        "-pix_fmt", "yuv420p",
         "-crf", "16",
         output_video
     ], check=True)
