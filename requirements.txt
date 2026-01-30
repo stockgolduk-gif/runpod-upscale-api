@@ -1,3 +1,9 @@
 fastapi
 uvicorn
-python-multipart
+pydantic
+requests
+torch
+torchvision
+opencv-python
+realesrgan
+basicsr
