@@ -1,72 +1,87 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-import os
-import uuid
-import requests
-from urllib.parse import urlparse
+import os, uuid, subprocess, requests
+import torch, cv2
+from realesrgan import RealESRGAN
 
 app = FastAPI(root_path="")
 
 BASE_DIR = "/workspace/files"
+WORK_DIR = "/workspace/work"
 os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(WORK_DIR, exist_ok=True)
 
-
-class UpscaleFromUrlRequest(BaseModel):
+class UpscaleRequest(BaseModel):
     video_url: HttpUrl
+    scale: int = 2  # 2x or 4x
 
 
 @app.get("/")
-def health_check():
-    return {
-        "status": "ok",
-        "source": "github",
-        "service": "runpod-upscale-api"
-    }
+def health():
+    return {"status": "ok", "service": "runpod-upscale-api"}
 
 
 @app.post("/upscale-from-url")
-def upscale_from_url(payload: UpscaleFromUrlRequest):
-    url = str(payload.video_url)
+def upscale_from_url(payload: UpscaleRequest):
+    job_id = uuid.uuid4().hex
 
-    # Infer extension (fallback to .mp4)
-    parsed = urlparse(url)
-    ext = os.path.splitext(parsed.path)[1]
-    if not ext:
-        ext = ".mp4"
+    input_video = f"{WORK_DIR}/{job_id}_input.mp4"
+    frames_dir = f"{WORK_DIR}/{job_id}_frames"
+    up_dir = f"{WORK_DIR}/{job_id}_up"
+    output_video = f"{BASE_DIR}/{job_id}_upscaled.mp4"
 
-    filename = f"{uuid.uuid4().hex}{ext}"
-    path = os.path.join(BASE_DIR, filename)
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(up_dir, exist_ok=True)
 
+    # --- Download video ---
     try:
-        r = requests.get(url, stream=True, timeout=120)
+        r = requests.get(payload.video_url, stream=True, timeout=120)
         r.raise_for_status()
-
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
+        with open(input_video, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                f.write(chunk)
     except Exception as e:
-        if os.path.exists(path):
-            os.remove(path)
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, f"Download failed: {e}")
+
+    # --- Extract frames ---
+    subprocess.run([
+        "ffmpeg", "-y", "-i", input_video,
+        f"{frames_dir}/frame_%06d.png"
+    ], check=True)
+
+    # --- Load AI upscaler ---
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = RealESRGAN(device, scale=payload.scale)
+    model.load_weights("RealESRGAN_x4plus.pth", download=True)
+
+    # --- Upscale frames ---
+    for f in sorted(os.listdir(frames_dir)):
+        img = cv2.imread(f"{frames_dir}/{f}")
+        out = model.predict(img)
+        cv2.imwrite(f"{up_dir}/{f}", out)
+
+    # --- Rebuild video (Adobe-safe) ---
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-framerate", "30",
+        "-i", f"{up_dir}/frame_%06d.png",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-crf", "16",
+        output_video
+    ], check=True)
 
     return {
-        "status": "downloaded",
-        "filename": filename,
-        "download_url": f"/download/{filename}"
+        "status": "complete",
+        "download_url": f"/download/{os.path.basename(output_video)}"
     }
 
 
 @app.get("/download/{filename}")
 def download(filename: str):
-    path = os.path.join(BASE_DIR, filename)
+    path = f"{BASE_DIR}/{filename}"
     if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(
-        path,
-        media_type="application/octet-stream",
-        filename=filename
-    )
+        raise HTTPException(404, "File not found")
+    return FileResponse(path, media_type="video/mp4", filename=filename)
