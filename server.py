@@ -25,6 +25,8 @@ BASE_DIR = "/workspace"
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 REGISTRY_PATH = os.path.join(JOBS_DIR, "registry.json")
 
+FFMPEG_PATH = "/usr/bin/ffmpeg"  # explicit path to avoid PATH issues
+
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 # ============================================================
@@ -77,8 +79,15 @@ def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
                     f.write(chunk)
 
 
+def _assert_ffmpeg():
+    if not os.path.exists(FFMPEG_PATH):
+        raise RuntimeError(
+            "ffmpeg binary not found. Install ffmpeg in the container or update FFMPEG_PATH."
+        )
+
+
 # ============================================================
-# Worker — CORRECT Real-ESRGAN USAGE
+# Worker — Real pipeline (ffmpeg path fixed)
 # ============================================================
 
 def worker_upscale_basic(job_id: str, video_url: str) -> None:
@@ -88,6 +97,7 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
         from realesrgan import RealESRGANer
         from basicsr.archs.rrdbnet_arch import RRDBNet
 
+        _assert_ffmpeg()
         _set_job(job_id, status="processing", progress="starting")
 
         job_dir = os.path.join(JOBS_DIR, job_id)
@@ -100,18 +110,30 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
         input_video = os.path.join(job_dir, "input.mp4")
         output_video = os.path.join(job_dir, "output_4k.mp4")
 
+        # -----------------------
         # Download
+        # -----------------------
         _set_job(job_id, progress="downloading")
         _download_file(video_url, input_video)
 
+        # -----------------------
         # Extract frames
+        # -----------------------
         _set_job(job_id, progress="extracting frames")
         subprocess.run(
-            ["ffmpeg", "-y", "-i", input_video, f"{frames_dir}/frame_%06d.png"],
+            [
+                FFMPEG_PATH,
+                "-y",
+                "-i",
+                input_video,
+                f"{frames_dir}/frame_%06d.png",
+            ],
             check=True,
         )
 
-        # Build Real-ESRGAN model (CORRECT API)
+        # -----------------------
+        # Load Real-ESRGAN model
+        # -----------------------
         _set_job(job_id, progress="loading model")
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -135,7 +157,9 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
             device=device,
         )
 
+        # -----------------------
         # Upscale frames
+        # -----------------------
         _set_job(job_id, progress="upscaling frames")
         frames = sorted(os.listdir(frames_dir))
         total = len(frames)
@@ -148,11 +172,13 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
             if i % 25 == 0:
                 _set_job(job_id, progress=f"upscaling {i}/{total}")
 
+        # -----------------------
         # Encode video
+        # -----------------------
         _set_job(job_id, progress="encoding video")
         subprocess.run(
             [
-                "ffmpeg",
+                FFMPEG_PATH,
                 "-y",
                 "-framerate",
                 "30",
@@ -205,7 +231,7 @@ def health():
     return {
         "status": "ok",
         "service": "runpod-upscale-api",
-        "mode": "async-step-2-fixed-realesrgan",
+        "mode": "async-step-2-ffmpeg-fixed",
     }
 
 
