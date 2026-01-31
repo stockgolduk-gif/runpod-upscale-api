@@ -7,10 +7,6 @@ import subprocess
 from typing import Dict, Any, Optional
 
 import requests
-import cv2
-import torch
-from realesrgan import RealESRGAN
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
@@ -95,6 +91,11 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
     """
 
     try:
+        # 🔥 IMPORTANT: heavy imports INSIDE worker
+        import cv2
+        import torch
+        from realesrgan import RealESRGAN
+
         _set_job(job_id, status="processing", progress="starting")
 
         job_dir = os.path.join(JOBS_DIR, job_id)
