@@ -25,9 +25,34 @@ BASE_DIR = "/workspace"
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 REGISTRY_PATH = os.path.join(JOBS_DIR, "registry.json")
 
-FFMPEG_PATH = "/usr/bin/ffmpeg"  # explicit path to avoid PATH issues
+FFMPEG_PATH = "/usr/bin/ffmpeg"
 
 os.makedirs(JOBS_DIR, exist_ok=True)
+
+# ============================================================
+# Ensure ffmpeg is installed (RunPod-safe)
+# ============================================================
+
+def ensure_ffmpeg():
+    if os.path.exists(FFMPEG_PATH):
+        return
+
+    subprocess.run(
+        ["apt-get", "update"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["apt-get", "install", "-y", "ffmpeg"],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if not os.path.exists(FFMPEG_PATH):
+        raise RuntimeError("ffmpeg install failed")
+
 
 # ============================================================
 # Job Registry
@@ -79,15 +104,8 @@ def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
                     f.write(chunk)
 
 
-def _assert_ffmpeg():
-    if not os.path.exists(FFMPEG_PATH):
-        raise RuntimeError(
-            "ffmpeg binary not found. Install ffmpeg in the container or update FFMPEG_PATH."
-        )
-
-
 # ============================================================
-# Worker — Real pipeline (ffmpeg path fixed)
+# Worker — FULL PIPELINE (ffmpeg auto-install)
 # ============================================================
 
 def worker_upscale_basic(job_id: str, video_url: str) -> None:
@@ -97,7 +115,8 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
         from realesrgan import RealESRGANer
         from basicsr.archs.rrdbnet_arch import RRDBNet
 
-        _assert_ffmpeg()
+        ensure_ffmpeg()
+
         _set_job(job_id, status="processing", progress="starting")
 
         job_dir = os.path.join(JOBS_DIR, job_id)
@@ -231,7 +250,7 @@ def health():
     return {
         "status": "ok",
         "service": "runpod-upscale-api",
-        "mode": "async-step-2-ffmpeg-fixed",
+        "mode": "async-step-2-ffmpeg-autoinstall",
     }
 
 
