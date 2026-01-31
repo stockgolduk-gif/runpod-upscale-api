@@ -3,29 +3,42 @@ import uuid
 import json
 import time
 import threading
+import subprocess
 from typing import Dict, Any, Optional
 
 import requests
+import cv2
+import torch
+from realesrgan import RealESRGAN
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 
-# ----------------------------
-# Config
-# ----------------------------
+# ============================================================
+# App
+# ============================================================
+
+app = FastAPI(root_path="")
+
+# ============================================================
+# Paths
+# ============================================================
+
 BASE_DIR = "/workspace"
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 REGISTRY_PATH = os.path.join(JOBS_DIR, "registry.json")
 
 os.makedirs(JOBS_DIR, exist_ok=True)
 
-# In-memory registry (mirrored to disk)
+# ============================================================
+# Job Registry (in-memory + disk mirror)
+# ============================================================
+
 JOB_REGISTRY: Dict[str, Dict[str, Any]] = {}
 REGISTRY_LOCK = threading.Lock()
 
-# ----------------------------
-# Helpers
-# ----------------------------
+
 def _load_registry() -> None:
     global JOB_REGISTRY
     if os.path.exists(REGISTRY_PATH):
@@ -35,11 +48,13 @@ def _load_registry() -> None:
         except Exception:
             JOB_REGISTRY = {}
 
+
 def _save_registry() -> None:
     tmp = REGISTRY_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(JOB_REGISTRY, f, indent=2)
     os.replace(tmp, REGISTRY_PATH)
+
 
 def _set_job(job_id: str, **fields: Any) -> None:
     with REGISTRY_LOCK:
@@ -47,12 +62,17 @@ def _set_job(job_id: str, **fields: Any) -> None:
         JOB_REGISTRY[job_id].update(fields)
         _save_registry()
 
+
 def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
     with REGISTRY_LOCK:
         return JOB_REGISTRY.get(job_id)
 
+
+# ============================================================
+# Helpers
+# ============================================================
+
 def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
-    # Stream download to avoid memory blowups
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
         with open(dst_path, "wb") as f:
@@ -60,69 +80,148 @@ def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
                 if chunk:
                     f.write(chunk)
 
-# ----------------------------
-# Worker
-# ----------------------------
-def worker_download_only(job_id: str, video_url: str) -> None:
+
+# ============================================================
+# Worker — REAL pipeline (Step 2)
+# ============================================================
+
+def worker_upscale_basic(job_id: str, video_url: str) -> None:
     """
-    STEP-1 worker: download only, mark complete.
-    In Step-2/3 we'll replace this with ffmpeg + Real-ESRGAN pipeline.
+    STEP 2:
+    - Download video
+    - Extract frames
+    - Real-ESRGAN upscale (fixed scale=2 for now)
+    - Rebuild video
     """
+
     try:
         _set_job(job_id, status="processing", progress="starting")
 
         job_dir = os.path.join(JOBS_DIR, job_id)
-        os.makedirs(job_dir, exist_ok=True)
+        frames_dir = os.path.join(job_dir, "frames")
+        up_dir = os.path.join(job_dir, "up")
 
-        input_path = os.path.join(job_dir, "input.mp4")
-        output_path = os.path.join(job_dir, "output_4k.mp4")  # placeholder for now
+        os.makedirs(frames_dir, exist_ok=True)
+        os.makedirs(up_dir, exist_ok=True)
 
+        input_video = os.path.join(job_dir, "input.mp4")
+        output_video = os.path.join(job_dir, "output_4k.mp4")
+
+        # -----------------------
+        # Download
+        # -----------------------
         _set_job(job_id, progress="downloading")
-        _download_file(video_url, input_path)
+        _download_file(video_url, input_video)
 
-        # For Step-1, we simply copy input -> output to validate download+async+download endpoint.
-        _set_job(job_id, progress="finalizing")
-        with open(input_path, "rb") as src, open(output_path, "wb") as dst:
-            while True:
-                buf = src.read(1024 * 1024)
-                if not buf:
-                    break
-                dst.write(buf)
+        # -----------------------
+        # Extract frames
+        # -----------------------
+        _set_job(job_id, progress="extracting frames")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                input_video,
+                f"{frames_dir}/frame_%06d.png",
+            ],
+            check=True,
+        )
 
+        # -----------------------
+        # AI Upscale (fixed x2 for Step 2)
+        # -----------------------
+        _set_job(job_id, progress="upscaling frames")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = RealESRGAN(device, scale=2)
+        model.load_weights("RealESRGAN_x4plus.pth", download=True)
+
+        frame_files = sorted(os.listdir(frames_dir))
+        total = len(frame_files)
+
+        for idx, name in enumerate(frame_files, start=1):
+            img_path = os.path.join(frames_dir, name)
+            out_path = os.path.join(up_dir, name)
+
+            img = cv2.imread(img_path)
+            out = model.predict(img)
+            cv2.imwrite(out_path, out)
+
+            if idx % 25 == 0:
+                _set_job(job_id, progress=f"upscaling {idx}/{total}")
+
+        # -----------------------
+        # Rebuild video
+        # -----------------------
+        _set_job(job_id, progress="encoding video")
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-framerate",
+                "30",
+                "-i",
+                f"{up_dir}/frame_%06d.png",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-crf",
+                "16",
+                output_video,
+            ],
+            check=True,
+        )
+
+        # -----------------------
+        # Complete
+        # -----------------------
         _set_job(
             job_id,
             status="complete",
             progress="done",
-            output_path=output_path,
+            output_path=output_video,
             download_url=f"/download/{job_id}.mp4",
             finished_at=time.time(),
         )
 
     except Exception as e:
-        _set_job(job_id, status="failed", error=str(e), finished_at=time.time())
+        _set_job(
+            job_id,
+            status="failed",
+            error=str(e),
+            finished_at=time.time(),
+        )
 
-# ----------------------------
+
+# ============================================================
 # API
-# ----------------------------
-app = FastAPI()
+# ============================================================
 
 class UpscaleRequest(BaseModel):
     video_url: HttpUrl
-    # Keep fields for later, but Step-1 ignores them safely
-    scale: Optional[int] = None  # 2 or 4
-    target: Optional[str] = "4k"
+
 
 @app.on_event("startup")
 def startup_event():
     _load_registry()
 
+
 @app.get("/")
-def root():
-    return {"status": "ok", "service": "runpod-upscale-api", "mode": "async-step-1"}
+def health():
+    return {
+        "status": "ok",
+        "service": "runpod-upscale-api",
+        "mode": "async-step-2",
+    }
+
 
 @app.post("/upscale")
 def upscale(req: UpscaleRequest):
     job_id = uuid.uuid4().hex[:10]
+
     _set_job(
         job_id,
         status="queued",
@@ -132,13 +231,14 @@ def upscale(req: UpscaleRequest):
     )
 
     t = threading.Thread(
-        target=worker_download_only,
+        target=worker_upscale_basic,
         args=(job_id, str(req.video_url)),
         daemon=True,
     )
     t.start()
 
     return {"job_id": job_id, "status": "queued"}
+
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
@@ -147,6 +247,7 @@ def status(job_id: str):
         raise HTTPException(status_code=404, detail="job_id not found")
     return {"job_id": job_id, **job}
 
+
 @app.get("/download/{job_id}.mp4")
 def download(job_id: str):
     job = _get_job(job_id)
@@ -154,7 +255,10 @@ def download(job_id: str):
         raise HTTPException(status_code=404, detail="job_id not found")
 
     if job.get("status") != "complete":
-        raise HTTPException(status_code=409, detail=f"job not complete (status={job.get('status')})")
+        raise HTTPException(
+            status_code=409,
+            detail=f"job not complete (status={job.get('status')})",
+        )
 
     output_path = job.get("output_path")
     if not output_path or not os.path.exists(output_path):
