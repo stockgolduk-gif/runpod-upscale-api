@@ -78,20 +78,16 @@ def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
 
 
 # ============================================================
-# Worker — REAL pipeline (Step 2)
+# Worker — REAL pipeline (DISABLED FOR ISOLATION)
 # ============================================================
 
 def worker_upscale_basic(job_id: str, video_url: str) -> None:
     """
-    STEP 2:
-    - Download video
-    - Extract frames
-    - Real-ESRGAN upscale (fixed scale=2 for now)
-    - Rebuild video
+    STEP 2 (TEMPORARILY DISABLED):
+    Worker intentionally not started to isolate environment crashes.
     """
-
     try:
-        # 🔥 IMPORTANT: heavy imports INSIDE worker
+        # Heavy imports intentionally kept here but worker is not started
         import cv2
         import torch
         from realesrgan import RealESRGAN
@@ -108,30 +104,15 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
         input_video = os.path.join(job_dir, "input.mp4")
         output_video = os.path.join(job_dir, "output_4k.mp4")
 
-        # -----------------------
-        # Download
-        # -----------------------
         _set_job(job_id, progress="downloading")
         _download_file(video_url, input_video)
 
-        # -----------------------
-        # Extract frames
-        # -----------------------
         _set_job(job_id, progress="extracting frames")
         subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-i",
-                input_video,
-                f"{frames_dir}/frame_%06d.png",
-            ],
+            ["ffmpeg", "-y", "-i", input_video, f"{frames_dir}/frame_%06d.png"],
             check=True,
         )
 
-        # -----------------------
-        # AI Upscale (fixed x2 for Step 2)
-        # -----------------------
         _set_job(job_id, progress="upscaling frames")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,21 +123,14 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
         total = len(frame_files)
 
         for idx, name in enumerate(frame_files, start=1):
-            img_path = os.path.join(frames_dir, name)
-            out_path = os.path.join(up_dir, name)
-
-            img = cv2.imread(img_path)
+            img = cv2.imread(os.path.join(frames_dir, name))
             out = model.predict(img)
-            cv2.imwrite(out_path, out)
+            cv2.imwrite(os.path.join(up_dir, name), out)
 
             if idx % 25 == 0:
                 _set_job(job_id, progress=f"upscaling {idx}/{total}")
 
-        # -----------------------
-        # Rebuild video
-        # -----------------------
         _set_job(job_id, progress="encoding video")
-
         subprocess.run(
             [
                 "ffmpeg",
@@ -176,9 +150,6 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
             check=True,
         )
 
-        # -----------------------
-        # Complete
-        # -----------------------
         _set_job(
             job_id,
             status="complete",
@@ -215,7 +186,7 @@ def health():
     return {
         "status": "ok",
         "service": "runpod-upscale-api",
-        "mode": "async-step-2",
+        "mode": "async-step-2-isolation",
     }
 
 
@@ -231,12 +202,13 @@ def upscale(req: UpscaleRequest):
         created_at=time.time(),
     )
 
-    t = threading.Thread(
-        target=worker_upscale_basic,
-        args=(job_id, str(req.video_url)),
-        daemon=True,
-    )
-    t.start()
+    # WORKER TEMPORARILY DISABLED FOR ISOLATION
+    # t = threading.Thread(
+    #     target=worker_upscale_basic,
+    #     args=(job_id, str(req.video_url)),
+    #     daemon=True,
+    # )
+    # t.start()
 
     return {"job_id": job_id, "status": "queued"}
 
