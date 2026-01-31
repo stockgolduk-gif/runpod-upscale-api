@@ -1,11 +1,23 @@
-fastapi
-uvicorn
-pydantic
-requests
-opencv-python
+# ============================================================
+# requirements.txt — RUNPOD-SAFE PIN SET (Torch + Real-ESRGAN)
+# ============================================================
 
+# ---- Web ----
+fastapi==0.110.0
+uvicorn==0.29.0
+requests==2.31.0
+pydantic==2.6.4
+
+# ---- Core ML (CUDA-safe on RunPod A10 / A100) ----
 torch==2.0.1
 torchvision==0.15.2
+torchaudio==2.0.2
 
-realesrgan
-basicsr
+# ---- Real-ESRGAN ----
+realesrgan==0.3.0
+basicsr==1.4.2
+
+# ---- Image / Video ----
+opencv-python-headless==4.9.0.80
+numpy==1.24.4
+Pillow==10.2.0
