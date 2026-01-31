@@ -28,7 +28,7 @@ REGISTRY_PATH = os.path.join(JOBS_DIR, "registry.json")
 os.makedirs(JOBS_DIR, exist_ok=True)
 
 # ============================================================
-# Job Registry (in-memory + disk mirror)
+# Job Registry
 # ============================================================
 
 JOB_REGISTRY: Dict[str, Dict[str, Any]] = {}
@@ -78,14 +78,15 @@ def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
 
 
 # ============================================================
-# Worker — REAL PIPELINE (ENABLED)
+# Worker — CORRECT Real-ESRGAN USAGE
 # ============================================================
 
 def worker_upscale_basic(job_id: str, video_url: str) -> None:
     try:
         import cv2
         import torch
-        from realesrgan import RealESRGAN
+        from realesrgan import RealESRGANer
+        from basicsr.archs.rrdbnet_arch import RRDBNet
 
         _set_job(job_id, status="processing", progress="starting")
 
@@ -110,19 +111,39 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
             check=True,
         )
 
-        # Upscale
-        _set_job(job_id, progress="upscaling frames")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = RealESRGAN(device, scale=2)
-        model.load_weights("RealESRGAN_x4plus.pth", download=True)
+        # Build Real-ESRGAN model (CORRECT API)
+        _set_job(job_id, progress="loading model")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        model = RRDBNet(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=23,
+            num_grow_ch=32,
+            scale=2,
+        )
+
+        upsampler = RealESRGANer(
+            scale=2,
+            model_path=None,
+            model=model,
+            tile=0,
+            tile_pad=10,
+            pre_pad=0,
+            half=device == "cuda",
+            device=device,
+        )
+
+        # Upscale frames
+        _set_job(job_id, progress="upscaling frames")
         frames = sorted(os.listdir(frames_dir))
         total = len(frames)
 
         for i, name in enumerate(frames, start=1):
             img = cv2.imread(os.path.join(frames_dir, name))
-            out = model.predict(img)
-            cv2.imwrite(os.path.join(up_dir, name), out)
+            output, _ = upsampler.enhance(img, outscale=2)
+            cv2.imwrite(os.path.join(up_dir, name), output)
 
             if i % 25 == 0:
                 _set_job(job_id, progress=f"upscaling {i}/{total}")
@@ -184,7 +205,7 @@ def health():
     return {
         "status": "ok",
         "service": "runpod-upscale-api",
-        "mode": "async-step-2-enabled",
+        "mode": "async-step-2-fixed-realesrgan",
     }
 
 
