@@ -26,32 +26,43 @@ JOBS_DIR = os.path.join(BASE_DIR, "jobs")
 REGISTRY_PATH = os.path.join(JOBS_DIR, "registry.json")
 
 FFMPEG_PATH = "/usr/bin/ffmpeg"
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+MODEL_PATH = os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth")
 
 os.makedirs(JOBS_DIR, exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ============================================================
-# Ensure ffmpeg is installed (RunPod-safe)
+# Ensure ffmpeg is installed
 # ============================================================
 
 def ensure_ffmpeg():
     if os.path.exists(FFMPEG_PATH):
         return
 
-    subprocess.run(
-        ["apt-get", "update"],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["apt-get", "install", "-y", "ffmpeg"],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    subprocess.run(["apt-get", "update"], check=True)
+    subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=True)
 
     if not os.path.exists(FFMPEG_PATH):
         raise RuntimeError("ffmpeg install failed")
+
+
+# ============================================================
+# Ensure Real-ESRGAN model is downloaded
+# ============================================================
+
+def ensure_model():
+    if os.path.exists(MODEL_PATH):
+        return
+
+    url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5/RealESRGAN_x2plus.pth"
+    r = requests.get(url, stream=True)
+    r.raise_for_status()
+
+    with open(MODEL_PATH, "wb") as f:
+        for chunk in r.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
 
 
 # ============================================================
@@ -105,7 +116,7 @@ def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
 
 
 # ============================================================
-# Worker — FULL PIPELINE (ffmpeg auto-install)
+# Worker — FIXED Real-ESRGAN pipeline
 # ============================================================
 
 def worker_upscale_basic(job_id: str, video_url: str) -> None:
@@ -116,6 +127,7 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
         from basicsr.archs.rrdbnet_arch import RRDBNet
 
         ensure_ffmpeg()
+        ensure_model()
 
         _set_job(job_id, status="processing", progress="starting")
 
@@ -140,18 +152,12 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
         # -----------------------
         _set_job(job_id, progress="extracting frames")
         subprocess.run(
-            [
-                FFMPEG_PATH,
-                "-y",
-                "-i",
-                input_video,
-                f"{frames_dir}/frame_%06d.png",
-            ],
+            [FFMPEG_PATH, "-y", "-i", input_video, f"{frames_dir}/frame_%06d.png"],
             check=True,
         )
 
         # -----------------------
-        # Load Real-ESRGAN model
+        # Load model (FIXED)
         # -----------------------
         _set_job(job_id, progress="loading model")
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -167,7 +173,7 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
 
         upsampler = RealESRGANer(
             scale=2,
-            model_path=None,
+            model_path=MODEL_PATH,  # ✅ FIXED (was None)
             model=model,
             tile=0,
             tile_pad=10,
@@ -250,7 +256,7 @@ def health():
     return {
         "status": "ok",
         "service": "runpod-upscale-api",
-        "mode": "async-step-2-ffmpeg-autoinstall",
+        "mode": "async-step-2-realesrgan-fixed",
     }
 
 
