@@ -32,13 +32,13 @@ os.makedirs(WORK_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # =========================
-# Models (stable sources)
+# Model (single, stable)
 # =========================
+# We intentionally use ONLY the x4 model.
+# For 1080p inputs we upscale with outscale=2 (NOT 4),
+# so we never generate 8K frames.
 MODEL_X4_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 MODEL_X4_PATH = f"{MODEL_DIR}/RealESRGAN_x4plus.pth"
-
-MODEL_X2_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5/RealESRGAN_x2plus.pth"
-MODEL_X2_PATH = f"{MODEL_DIR}/RealESRGAN_x2plus.pth"
 
 # =========================
 # In-memory job store
@@ -59,28 +59,30 @@ def ensure_ffmpeg():
         subprocess.run(["apt-get", "update"], check=True)
         subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=True)
 
-def ensure_model(url: str, path: str):
-    if not os.path.exists(path):
-        r = requests.get(url, stream=True, timeout=120)
+def ensure_model():
+    if not os.path.exists(MODEL_X4_PATH):
+        r = requests.get(MODEL_X4_URL, stream=True, timeout=120)
         r.raise_for_status()
-        with open(path, "wb") as f:
+        with open(MODEL_X4_PATH, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
                 f.write(chunk)
 
 def probe_video(path: str):
-    cmd = [
-        FFMPEG_PATH, "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate",
-        "-of", "json",
-        path
-    ]
-    out = subprocess.check_output(["ffprobe"] + cmd[1:], text=True)
+    out = subprocess.check_output(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,r_frame_rate",
+            "-of", "json",
+            path
+        ],
+        text=True
+    )
     data = json.loads(out)
-    stream = data["streams"][0]
-    width = int(stream["width"])
-    height = int(stream["height"])
-    num, den = stream["r_frame_rate"].split("/")
+    s = data["streams"][0]
+    width = int(s["width"])
+    height = int(s["height"])
+    num, den = s["r_frame_rate"].split("/")
     fps = float(num) / float(den)
     return width, height, fps
 
@@ -93,6 +95,7 @@ def worker(job_id: str, video_url: str):
         JOBS[job_id]["progress"] = "downloading"
 
         ensure_ffmpeg()
+        ensure_model()
 
         input_video = f"{WORK_DIR}/{job_id}_input.mp4"
         frames_dir = f"{WORK_DIR}/{job_id}_frames"
@@ -109,23 +112,17 @@ def worker(job_id: str, video_url: str):
             for chunk in r.iter_content(1024 * 1024):
                 f.write(chunk)
 
-        # Probe video
+        # Probe
         JOBS[job_id]["progress"] = "probing video"
         width, height, fps = probe_video(input_video)
 
-        # Decide scale
+        # Decide upscale factor (NO 8K EVER)
         if height <= 720:
-            scale = 4
-            model_path = MODEL_X4_PATH
-            model_url = MODEL_X4_URL
+            outscale = 4   # 720p → ~4K
         elif height <= 1080:
-            scale = 2
-            model_path = MODEL_X2_PATH
-            model_url = MODEL_X2_URL
+            outscale = 2   # 1080p → ~4K
         else:
             raise RuntimeError("Input resolution higher than 1080p is not supported")
-
-        ensure_model(model_url, model_path)
 
         # Extract frames (keep original FPS)
         JOBS[job_id]["progress"] = "extracting frames"
@@ -137,7 +134,7 @@ def worker(job_id: str, video_url: str):
             check=True
         )
 
-        # Load model
+        # Load model (single x4 model, dynamic outscale)
         JOBS[job_id]["progress"] = "loading model"
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -147,12 +144,12 @@ def worker(job_id: str, video_url: str):
             num_feat=64,
             num_block=23,
             num_grow_ch=32,
-            scale=scale
+            scale=4
         )
 
         upsampler = RealESRGANer(
-            scale=scale,
-            model_path=model_path,
+            scale=4,
+            model_path=MODEL_X4_PATH,
             model=model,
             tile=0,
             tile_pad=10,
@@ -161,16 +158,16 @@ def worker(job_id: str, video_url: str):
             device=device
         )
 
-        # Upscale frames
+        # Upscale frames (dynamic outscale)
         JOBS[job_id]["progress"] = "upscaling frames"
         for fname in sorted(os.listdir(frames_dir)):
             img = cv2.imread(os.path.join(frames_dir, fname))
             if img is None:
                 continue
-            out, _ = upsampler.enhance(img, outscale=scale)
+            out, _ = upsampler.enhance(img, outscale=outscale)
             cv2.imwrite(os.path.join(up_dir, fname), out)
 
-        # Encode to EXACT 4K @ original FPS
+        # Encode EXACT 4K @ original FPS
         JOBS[job_id]["progress"] = "encoding video"
         subprocess.run(
             [
@@ -205,7 +202,7 @@ def health():
     return {
         "status": "ok",
         "service": "runpod-upscale-api",
-        "mode": "dynamic-x2-x4-4k-60fps"
+        "mode": "dynamic-720p-x4-1080p-x2-4k-60fps"
     }
 
 @app.post("/upscale")
