@@ -1,165 +1,107 @@
-import os
-import uuid
-import json
-import time
-import threading
-import subprocess
-from typing import Dict, Any, Optional
-
-import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
+import os
+import uuid
+import threading
+import time
+import subprocess
+import requests
 
-# ============================================================
-# App
-# ============================================================
+import torch
+import cv2
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
 
-app = FastAPI(root_path="")
+app = FastAPI()
 
-# ============================================================
+# -------------------------
 # Paths
-# ============================================================
+# -------------------------
+BASE_DIR = "/workspace/files"
+WORK_DIR = "/workspace/work"
+MODEL_DIR = "/workspace/models"
 
-BASE_DIR = "/workspace"
-JOBS_DIR = os.path.join(BASE_DIR, "jobs")
-REGISTRY_PATH = os.path.join(JOBS_DIR, "registry.json")
-
-FFMPEG_PATH = "/usr/bin/ffmpeg"
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-MODEL_PATH = os.path.join(MODEL_DIR, "RealESRGAN_x2plus.pth")
-
-os.makedirs(JOBS_DIR, exist_ok=True)
+os.makedirs(BASE_DIR, exist_ok=True)
+os.makedirs(WORK_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ============================================================
-# Ensure ffmpeg is installed
-# ============================================================
+FFMPEG_PATH = "/usr/bin/ffmpeg"
 
+MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+MODEL_PATH = f"{MODEL_DIR}/RealESRGAN_x4plus.pth"
+
+# -------------------------
+# In-memory job store
+# -------------------------
+JOBS = {}
+
+# -------------------------
+# Models
+# -------------------------
+class UpscaleRequest(BaseModel):
+    video_url: HttpUrl
+
+# -------------------------
+# Utilities
+# -------------------------
 def ensure_ffmpeg():
-    if os.path.exists(FFMPEG_PATH):
-        return
-
-    subprocess.run(["apt-get", "update"], check=True)
-    subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=True)
-
     if not os.path.exists(FFMPEG_PATH):
-        raise RuntimeError("ffmpeg install failed")
-
-
-# ============================================================
-# Ensure Real-ESRGAN model is downloaded
-# ============================================================
+        subprocess.run(
+            ["apt-get", "update"],
+            check=True
+        )
+        subprocess.run(
+            ["apt-get", "install", "-y", "ffmpeg"],
+            check=True
+        )
 
 def ensure_model():
-    if os.path.exists(MODEL_PATH):
-        return
-
-    url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5/RealESRGAN_x2plus.pth"
-    r = requests.get(url, stream=True)
-    r.raise_for_status()
-
-    with open(MODEL_PATH, "wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
+    if not os.path.exists(MODEL_PATH):
+        r = requests.get(MODEL_URL, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
                 f.write(chunk)
 
-
-# ============================================================
-# Job Registry
-# ============================================================
-
-JOB_REGISTRY: Dict[str, Dict[str, Any]] = {}
-REGISTRY_LOCK = threading.Lock()
-
-
-def _load_registry() -> None:
-    global JOB_REGISTRY
-    if os.path.exists(REGISTRY_PATH):
-        try:
-            with open(REGISTRY_PATH, "r") as f:
-                JOB_REGISTRY = json.load(f)
-        except Exception:
-            JOB_REGISTRY = {}
-
-
-def _save_registry() -> None:
-    tmp = REGISTRY_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(JOB_REGISTRY, f, indent=2)
-    os.replace(tmp, REGISTRY_PATH)
-
-
-def _set_job(job_id: str, **fields: Any) -> None:
-    with REGISTRY_LOCK:
-        JOB_REGISTRY.setdefault(job_id, {})
-        JOB_REGISTRY[job_id].update(fields)
-        _save_registry()
-
-
-def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
-    with REGISTRY_LOCK:
-        return JOB_REGISTRY.get(job_id)
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def _download_file(url: str, dst_path: str, timeout=(10, 600)) -> None:
-    with requests.get(url, stream=True, timeout=timeout) as r:
-        r.raise_for_status()
-        with open(dst_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-
-# ============================================================
-# Worker — FIXED Real-ESRGAN pipeline
-# ============================================================
-
-def worker_upscale_basic(job_id: str, video_url: str) -> None:
+# -------------------------
+# Worker
+# -------------------------
+def worker_upscale(job_id: str, video_url: str):
     try:
-        import cv2
-        import torch
-        from realesrgan import RealESRGANer
-        from basicsr.archs.rrdbnet_arch import RRDBNet
+        JOBS[job_id]["status"] = "processing"
+        JOBS[job_id]["progress"] = "downloading"
 
         ensure_ffmpeg()
         ensure_model()
 
-        _set_job(job_id, status="processing", progress="starting")
-
-        job_dir = os.path.join(JOBS_DIR, job_id)
-        frames_dir = os.path.join(job_dir, "frames")
-        up_dir = os.path.join(job_dir, "up")
+        input_video = f"{WORK_DIR}/{job_id}_input.mp4"
+        frames_dir = f"{WORK_DIR}/{job_id}_frames"
+        up_dir = f"{WORK_DIR}/{job_id}_up"
+        output_video = f"{BASE_DIR}/{job_id}.mp4"
 
         os.makedirs(frames_dir, exist_ok=True)
         os.makedirs(up_dir, exist_ok=True)
 
-        input_video = os.path.join(job_dir, "input.mp4")
-        output_video = os.path.join(job_dir, "output_4k.mp4")
+        # Download video
+        r = requests.get(video_url, stream=True, timeout=120)
+        r.raise_for_status()
+        with open(input_video, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                f.write(chunk)
 
-        # -----------------------
-        # Download
-        # -----------------------
-        _set_job(job_id, progress="downloading")
-        _download_file(video_url, input_video)
-
-        # -----------------------
         # Extract frames
-        # -----------------------
-        _set_job(job_id, progress="extracting frames")
+        JOBS[job_id]["progress"] = "extracting frames"
         subprocess.run(
-            [FFMPEG_PATH, "-y", "-i", input_video, f"{frames_dir}/frame_%06d.png"],
-            check=True,
+            [
+                FFMPEG_PATH, "-y", "-i", input_video,
+                f"{frames_dir}/frame_%06d.png"
+            ],
+            check=True
         )
 
-        # -----------------------
-        # Load model (FIXED)
-        # -----------------------
-        _set_job(job_id, progress="loading model")
+        # Load model
+        JOBS[job_id]["progress"] = "loading model"
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         model = RRDBNet(
@@ -168,152 +110,100 @@ def worker_upscale_basic(job_id: str, video_url: str) -> None:
             num_feat=64,
             num_block=23,
             num_grow_ch=32,
-            scale=2,
+            scale=4
         )
 
         upsampler = RealESRGANer(
-            scale=2,
-            model_path=MODEL_PATH,  # ✅ FIXED (was None)
+            scale=4,
+            model_path=MODEL_PATH,
             model=model,
             tile=0,
             tile_pad=10,
             pre_pad=0,
-            half=device == "cuda",
+            half=torch.cuda.is_available(),
             device=device,
         )
 
-        # -----------------------
         # Upscale frames
-        # -----------------------
-        _set_job(job_id, progress="upscaling frames")
-        frames = sorted(os.listdir(frames_dir))
-        total = len(frames)
+        JOBS[job_id]["progress"] = "upscaling frames"
+        for fname in sorted(os.listdir(frames_dir)):
+            img = cv2.imread(os.path.join(frames_dir, fname))
+            if img is None:
+                continue
+            output, _ = upsampler.enhance(img, outscale=4)
+            cv2.imwrite(os.path.join(up_dir, fname), output)
 
-        for i, name in enumerate(frames, start=1):
-            img = cv2.imread(os.path.join(frames_dir, name))
-            output, _ = upsampler.enhance(img, outscale=2)
-            cv2.imwrite(os.path.join(up_dir, name), output)
-
-            if i % 25 == 0:
-                _set_job(job_id, progress=f"upscaling {i}/{total}")
-
-        # -----------------------
-        # Encode video
-        # -----------------------
-        _set_job(job_id, progress="encoding video")
+        # Encode final video (Adobe-safe)
+        JOBS[job_id]["progress"] = "encoding video"
         subprocess.run(
             [
-                FFMPEG_PATH,
-                "-y",
-                "-framerate",
-                "30",
-                "-i",
-                f"{up_dir}/frame_%06d.png",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-crf",
-                "16",
-                output_video,
+                FFMPEG_PATH, "-y",
+                "-framerate", "30",
+                "-i", f"{up_dir}/frame_%06d.png",
+                "-vf", "scale=3840:2160",
+                "-c:v", "libx264",
+                "-profile:v", "high",
+                "-pix_fmt", "yuv420p",
+                "-crf", "16",
+                output_video
             ],
-            check=True,
+            check=True
         )
 
-        _set_job(
-            job_id,
-            status="complete",
-            progress="done",
-            output_path=output_video,
-            download_url=f"/download/{job_id}.mp4",
-            finished_at=time.time(),
-        )
+        JOBS[job_id]["status"] = "complete"
+        JOBS[job_id]["progress"] = "done"
+        JOBS[job_id]["download_url"] = f"/download/{job_id}.mp4"
+        JOBS[job_id]["finished_at"] = time.time()
 
     except Exception as e:
-        _set_job(
-            job_id,
-            status="failed",
-            error=str(e),
-            finished_at=time.time(),
-        )
+        JOBS[job_id]["status"] = "failed"
+        JOBS[job_id]["error"] = str(e)
+        JOBS[job_id]["finished_at"] = time.time()
 
-
-# ============================================================
+# -------------------------
 # API
-# ============================================================
-
-class UpscaleRequest(BaseModel):
-    video_url: HttpUrl
-
-
-@app.on_event("startup")
-def startup_event():
-    _load_registry()
-
-
+# -------------------------
 @app.get("/")
 def health():
     return {
         "status": "ok",
         "service": "runpod-upscale-api",
-        "mode": "async-step-2-realesrgan-fixed",
+        "mode": "async-realesrgan-x4"
     }
-
 
 @app.post("/upscale")
 def upscale(req: UpscaleRequest):
     job_id = uuid.uuid4().hex[:10]
 
-    _set_job(
-        job_id,
-        status="queued",
-        progress="queued",
-        video_url=str(req.video_url),
-        created_at=time.time(),
-    )
+    JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "progress": "queued",
+        "video_url": str(req.video_url),
+        "created_at": time.time(),
+    }
 
     t = threading.Thread(
-        target=worker_upscale_basic,
+        target=worker_upscale,
         args=(job_id, str(req.video_url)),
         daemon=True,
     )
     t.start()
 
-    return {"job_id": job_id, "status": "queued"}
-
+    return {
+        "job_id": job_id,
+        "status": "queued"
+    }
 
 @app.get("/status/{job_id}")
 def status(job_id: str):
-    job = _get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job_id not found")
-    return {"job_id": job_id, **job}
+    if job_id not in JOBS:
+        raise HTTPException(404, "Job not found")
+    return JOBS[job_id]
 
-
-@app.get("/download/{job_id}.mp4")
-def download(job_id: str):
-    job = _get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job_id not found")
-
-    if job.get("status") != "complete":
-        raise HTTPException(
-            status_code=409,
-            detail=f"job not complete (status={job.get('status')})",
-        )
-
-    output_path = job.get("output_path")
-    if not output_path or not os.path.exists(output_path):
-        raise HTTPException(status_code=404, detail="output not found")
-
-    return FileResponse(
-        output_path,
-        media_type="video/mp4",
-        filename=f"{job_id}.mp4",
-    )
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, log_level="info")
+@app.get("/download/{filename}")
+def download(filename: str):
+    path = f"{BASE_DIR}/{filename}"
+    if not os.path.exists(path):
+        raise HTTPException(404, "File not found")
+    return FileResponse(path, media_type="video/mp4", filename=filename)
